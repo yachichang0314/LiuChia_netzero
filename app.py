@@ -121,6 +121,97 @@ st.markdown(
 # =========================================================
 # Data / calculation helpers
 # =========================================================
+def uploaded_file_to_df(uploaded_file) -> pd.DataFrame:
+    """Read an uploaded CSV with common Traditional Chinese encodings."""
+    raw = uploaded_file.getvalue()
+
+    for encoding in ("utf-8-sig", "utf-8", "big5", "cp950"):
+        try:
+            return pd.read_csv(io.BytesIO(raw), encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError("無法辨識 CSV 編碼，請另存為 UTF-8 CSV 後重新上傳。")
+
+
+def prepare_model_input(
+    load_df: pd.DataFrame,
+    solar_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Validate and merge:
+    1. load file: timestamp, load_kw
+    2. solar file: timestamp, solar_profile
+    """
+    load_required = {"timestamp", "load_kw"}
+    solar_required = {"timestamp", "solar_profile"}
+
+    load_missing = load_required - set(load_df.columns)
+    solar_missing = solar_required - set(solar_df.columns)
+
+    if load_missing:
+        raise ValueError(
+            f"院區逐時用電檔缺少欄位：{', '.join(sorted(load_missing))}"
+        )
+    if solar_missing:
+        raise ValueError(
+            f"太陽光電 profile 檔缺少欄位：{', '.join(sorted(solar_missing))}"
+        )
+
+    load = load_df[["timestamp", "load_kw"]].copy()
+    solar = solar_df[["timestamp", "solar_profile"]].copy()
+
+    load["timestamp"] = pd.to_datetime(load["timestamp"], errors="coerce")
+    solar["timestamp"] = pd.to_datetime(solar["timestamp"], errors="coerce")
+    load["load_kw"] = pd.to_numeric(load["load_kw"], errors="coerce")
+    solar["solar_profile"] = pd.to_numeric(
+        solar["solar_profile"], errors="coerce"
+    )
+
+    load = load.dropna(subset=["timestamp", "load_kw"])
+    solar = solar.dropna(subset=["timestamp", "solar_profile"])
+
+    if load["timestamp"].duplicated().any():
+        duplicate_count = int(load["timestamp"].duplicated().sum())
+        raise ValueError(f"院區逐時用電檔有 {duplicate_count} 筆重複 timestamp。")
+
+    if solar["timestamp"].duplicated().any():
+        duplicate_count = int(solar["timestamp"].duplicated().sum())
+        raise ValueError(
+            f"太陽光電 profile 檔有 {duplicate_count} 筆重複 timestamp。"
+        )
+
+    if (load["load_kw"] < 0).any():
+        raise ValueError("load_kw 不可小於 0。")
+
+    if (solar["solar_profile"] < 0).any():
+        raise ValueError("solar_profile 不可小於 0。")
+
+    load = load.sort_values("timestamp")
+    solar = solar.sort_values("timestamp")
+
+    merged = pd.merge(
+        load,
+        solar,
+        on="timestamp",
+        how="inner",
+        validate="one_to_one",
+    ).sort_values("timestamp").reset_index(drop=True)
+
+    if merged.empty:
+        raise ValueError("兩個檔案沒有相同的 timestamp，無法合併。")
+
+    load_only = len(load) - len(merged)
+    solar_only = len(solar) - len(merged)
+
+    merged.attrs["load_rows"] = len(load)
+    merged.attrs["solar_rows"] = len(solar)
+    merged.attrs["load_unmatched_rows"] = load_only
+    merged.attrs["solar_unmatched_rows"] = solar_only
+
+    return merged
+
+
 def make_kpi_card(title: str, value: str, note: str) -> None:
     st.markdown(
         f"""
@@ -212,10 +303,18 @@ with g3:
 with st.sidebar:
     st.title("規劃條件")
 
-    uploaded = st.file_uploader(
-        "上傳逐時資料 CSV",
+    load_file = st.file_uploader(
+        "1. 上傳院區逐時用電 CSV",
         type=["csv"],
-        help="必要欄位：timestamp、load_kw、solar_profile",
+        key="load_file",
+        help="必要欄位：timestamp、load_kw",
+    )
+
+    solar_file = st.file_uploader(
+        "2. 上傳太陽光電逐時 profile CSV",
+        type=["csv"],
+        key="solar_file",
+        help="必要欄位：timestamp、solar_profile",
     )
 
     goal_label = st.radio(
@@ -293,13 +392,27 @@ tab1, tab2, tab3, tab4 = st.tabs(["使用說明", "資料預覽", "規劃結果"
 
 with tab1:
     st.markdown("### 資料格式")
-    st.code(
-        "timestamp,load_kw,solar_profile\n"
-        "2025-01-01 00:00:00,850,0\n"
-        "2025-01-01 01:00:00,810,0\n"
-        "2025-01-01 12:00:00,1060,0.78",
-        language="csv",
-    )
+    f1, f2 = st.columns(2)
+
+    with f1:
+        st.markdown("#### 院區逐時用電檔")
+        st.code(
+            "timestamp,load_kw\n"
+            "2025-01-01 00:00:00,850\n"
+            "2025-01-01 01:00:00,810\n"
+            "2025-01-01 12:00:00,1060",
+            language="csv",
+        )
+
+    with f2:
+        st.markdown("#### 太陽光電逐時 profile 檔")
+        st.code(
+            "timestamp,solar_profile\n"
+            "2025-01-01 00:00:00,0\n"
+            "2025-01-01 01:00:00,0\n"
+            "2025-01-01 12:00:00,0.78",
+            language="csv",
+        )
     st.markdown(
         """
         <div class="section-note">
@@ -324,38 +437,131 @@ with tab1:
     )
 
 with tab2:
-    if uploaded is None:
-        st.info("請先從左側上傳逐時 CSV。")
+    if load_file is None and solar_file is None:
+        st.info("請從左側分別上傳院區逐時用電檔與太陽光電 profile 檔。")
     else:
-        try:
-            preview_df = validate_input(uploaded_file_to_df(uploaded))
-            c1, c2, c3 = st.columns(3)
-            c1.metric("資料筆數", f"{len(preview_df):,}")
-            c2.metric("期間", f"{preview_df['timestamp'].min():%Y-%m-%d} 至 {preview_df['timestamp'].max():%Y-%m-%d}")
-            c3.metric("總用電量", f"{preview_df['load_kw'].sum():,.0f} kWh")
-            st.dataframe(preview_df.head(100), use_container_width=True, hide_index=True)
+        p1, p2 = st.columns(2)
 
-            chart_df = preview_df.set_index("timestamp")[["load_kw", "solar_profile"]]
-            fig_preview = go.Figure()
-            fig_preview.add_trace(go.Scatter(x=chart_df.index, y=chart_df["load_kw"], name="Load (kW)"))
-            fig_preview.add_trace(go.Scatter(x=chart_df.index, y=chart_df["solar_profile"], name="Solar profile", yaxis="y2"))
-            fig_preview.update_layout(
-                height=430,
-                yaxis=dict(title="Load (kW)"),
-                yaxis2=dict(title="Solar profile", overlaying="y", side="right"),
-                margin=dict(l=20, r=20, t=25, b=20),
-            )
-            st.plotly_chart(fig_preview, use_container_width=True)
-        except Exception as exc:
-            st.error(str(exc))
+        with p1:
+            st.markdown("### 院區逐時用電")
+            if load_file is None:
+                st.info("尚未上傳院區逐時用電檔。")
+            else:
+                try:
+                    load_preview = uploaded_file_to_df(load_file)
+                    st.dataframe(
+                        load_preview.head(100),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                except Exception as exc:
+                    st.error(str(exc))
+
+        with p2:
+            st.markdown("### 太陽光電逐時 profile")
+            if solar_file is None:
+                st.info("尚未上傳太陽光電 profile 檔。")
+            else:
+                try:
+                    solar_preview = uploaded_file_to_df(solar_file)
+                    st.dataframe(
+                        solar_preview.head(100),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                except Exception as exc:
+                    st.error(str(exc))
+
+        if load_file is not None and solar_file is not None:
+            try:
+                preview_df = prepare_model_input(
+                    uploaded_file_to_df(load_file),
+                    uploaded_file_to_df(solar_file),
+                )
+
+                st.markdown("### 合併後模型資料")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("共同資料筆數", f"{len(preview_df):,}")
+                c2.metric(
+                    "期間",
+                    f"{preview_df['timestamp'].min():%Y-%m-%d} 至 "
+                    f"{preview_df['timestamp'].max():%Y-%m-%d}",
+                )
+                c3.metric(
+                    "總用電量",
+                    f"{preview_df['load_kw'].sum():,.0f} kWh",
+                )
+                c4.metric(
+                    "每 kW 光電年發電量",
+                    f"{preview_df['solar_profile'].sum():,.1f} kWh/kW",
+                )
+
+                unmatched_load = preview_df.attrs.get(
+                    "load_unmatched_rows", 0
+                )
+                unmatched_solar = preview_df.attrs.get(
+                    "solar_unmatched_rows", 0
+                )
+                if unmatched_load or unmatched_solar:
+                    st.warning(
+                        "兩檔時間未完全對齊："
+                        f"用電檔有 {unmatched_load} 筆未配對，"
+                        f"光電檔有 {unmatched_solar} 筆未配對。"
+                        "模型只使用 timestamp 相同的資料。"
+                    )
+                else:
+                    st.success("兩個檔案的 timestamp 已完整配對。")
+
+                st.dataframe(
+                    preview_df.head(100),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                chart_df = preview_df.set_index("timestamp")[
+                    ["load_kw", "solar_profile"]
+                ]
+                fig_preview = go.Figure()
+                fig_preview.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df["load_kw"],
+                        name="Load (kW)",
+                    )
+                )
+                fig_preview.add_trace(
+                    go.Scatter(
+                        x=chart_df.index,
+                        y=chart_df["solar_profile"],
+                        name="Solar profile",
+                        yaxis="y2",
+                    )
+                )
+                fig_preview.update_layout(
+                    height=430,
+                    yaxis=dict(title="Load (kW)"),
+                    yaxis2=dict(
+                        title="Solar profile",
+                        overlaying="y",
+                        side="right",
+                    ),
+                    margin=dict(l=20, r=20, t=25, b=20),
+                )
+                st.plotly_chart(fig_preview, use_container_width=True)
+
+            except Exception as exc:
+                st.error(f"資料合併失敗：{exc}")
 
 with tab3:
     if run_btn:
-        if uploaded is None:
-            st.error("請先上傳逐時資料。")
+        if load_file is None or solar_file is None:
+            st.error("請先上傳院區逐時用電檔與太陽光電 profile 檔。")
         else:
             try:
-                df = validate_input(uploaded_file_to_df(uploaded))
+                df = prepare_model_input(
+                    uploaded_file_to_df(load_file),
+                    uploaded_file_to_df(solar_file),
+                )
 
                 if min_soc >= max_soc:
                     raise ValueError("最小 SOC 必須小於最大 SOC。")
